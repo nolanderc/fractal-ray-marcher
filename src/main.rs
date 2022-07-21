@@ -1,5 +1,7 @@
 mod frame_counter;
 mod gpu;
+#[macro_use]
+mod shader;
 
 use std::{
     collections::HashSet,
@@ -30,8 +32,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let event_loop = EventLoop::new();
+    let event_loop = EventLoop::with_user_event();
     let mut state = State::new(&event_loop).block_on()?;
+
+    watch_shader_changes(event_loop.create_proxy());
+
     let mut last_update = Instant::now();
     let mut modifiers = winit::event::ModifiersState::default();
 
@@ -53,13 +58,15 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    match input.virtual_keycode {
-                        Some(VirtualKeyCode::Escape) => *flow = ControlFlow::Exit,
+                    if input.state == ElementState::Pressed {
+                        match input.virtual_keycode {
+                            Some(VirtualKeyCode::Escape) => *flow = ControlFlow::Exit,
 
-                        // reset camera focus to default
-                        Some(VirtualKeyCode::Key0) => state.camera = Default::default(),
+                            // reset camera focus to default
+                            Some(VirtualKeyCode::Key0) => state.camera = Default::default(),
 
-                        _ => {}
+                            _ => {}
+                        }
                     }
                 }
 
@@ -74,9 +81,13 @@ fn main() -> anyhow::Result<()> {
                 // handle changes in window size
                 WindowEvent::Resized(new_size) => state.resize(new_size),
                 WindowEvent::ScaleFactorChanged {
-                    scale_factor: _,
+                    scale_factor,
                     new_inner_size,
-                } => state.resize(*new_inner_size),
+                } => {
+                    let width = new_inner_size.width as f64 / scale_factor;
+                    let height = new_inner_size.height as f64 / scale_factor;
+                    state.resize([width as u32, height as u32].into());
+                },
 
                 WindowEvent::ModifiersChanged(new_modifiers) => modifiers = new_modifiers,
 
@@ -86,7 +97,7 @@ fn main() -> anyhow::Result<()> {
                 DeviceEvent::MouseMotion { delta: (dx, dy) } => {
                     if held_buttons.contains(&MouseButton::Left) {
                         let size = state.window.inner_size();
-                        let scale = -1.0 / size.width as f32;
+                        let scale = -state.window.scale_factor() as f32 / size.width as f32;
                         let dx = dx as f32 * scale;
                         let dy = dy as f32 * scale;
 
@@ -116,9 +127,71 @@ fn main() -> anyhow::Result<()> {
                     error!("could not render frame: {:#}", error);
                 }
             }
+            Event::UserEvent(event) => match event {
+                UserEvent::Reload => {
+                    if let Err(error) = state.reload() {
+                        error!(%error, "could not reload")
+                    }
+                }
+            },
             _ => {}
         }
     })
+}
+
+fn watch_shader_changes(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+    use notify::Watcher;
+
+    std::thread::spawn(move || {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let debounce = Duration::from_millis(200);
+
+        let result = notify::PollWatcher::new(sender, debounce).and_then(|mut watcher| {
+            watcher.watch("shaders/", notify::RecursiveMode::Recursive)?;
+            Ok(watcher)
+        });
+
+        // keep the watcher around for the duration of the event loop so that the channel isn't
+        // closed
+        let _watcher = match result {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                warn!("could not start file watcher: {error:#}");
+                return;
+            }
+        };
+
+        while let Ok(event) = receiver.recv() {
+            match event {
+                notify::DebouncedEvent::Rescan
+                | notify::DebouncedEvent::Error(_, _)
+                | notify::DebouncedEvent::NoticeWrite(_)
+                | notify::DebouncedEvent::NoticeRemove(_) => continue,
+                notify::DebouncedEvent::Create(_)
+                | notify::DebouncedEvent::Write(_)
+                | notify::DebouncedEvent::Chmod(_)
+                | notify::DebouncedEvent::Remove(_)
+                | notify::DebouncedEvent::Rename(_, _) => {
+                    if proxy.send_event(UserEvent::Reload).is_err() {
+                        break;
+                    }
+
+                    // sleep a bit to avoid racing the event queue
+                    std::thread::sleep(Duration::from_millis(10));
+
+                    // skip all events currently in the queue
+                    while receiver.try_recv().is_ok() {}
+                }
+            }
+        }
+
+        eprintln!("ending watcher");
+    });
+}
+
+#[derive(Debug)]
+pub enum UserEvent {
+    Reload,
 }
 
 struct State {
@@ -144,7 +217,6 @@ struct State {
 
 struct RenderPipeline {
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
 }
@@ -156,7 +228,9 @@ struct Uniforms {
     near: f32,
     far: f32,
     time: f32,
-    _padding: f32,
+    width: f32,
+    height: f32,
+    _padding: [f32; 3],
 }
 
 #[repr(C)]
@@ -175,12 +249,12 @@ impl Default for Camera {
     fn default() -> Self {
         Camera {
             focus: glam::vec3(0.0, 0.0, 0.0),
-            yaw: 0.0,
-            pitch: 0.0,
-            distance: 3.0,
+            yaw: 3.5,
+            pitch: -0.5,
+            distance: 2.0,
             fov: 70f32.to_radians(),
-            near: 0.1,
-            far: 10.0,
+            near: 0.01,
+            far: 100.0,
         }
     }
 }
@@ -229,8 +303,9 @@ impl Camera {
 }
 
 impl RenderPipeline {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let module = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> anyhow::Result<Self> {
+        let module = device
+            .create_shader_module(load_shader!("shader.wgsl").context("could not load shader")?);
 
         let vertex = wgpu::VertexState {
             module: &module,
@@ -288,12 +363,11 @@ impl RenderPipeline {
             multiview: None,
         });
 
-        Self {
+        Ok(Self {
             pipeline,
-            bind_group_layout,
             bind_group,
             uniform_buffer,
-        }
+        })
     }
 
     fn bind_group_layout_entries() -> [wgpu::BindGroupLayoutEntry; 1] {
@@ -326,7 +400,7 @@ impl RenderPipeline {
 }
 
 impl State {
-    async fn new(event_loop: &EventLoop<()>) -> anyhow::Result<State> {
+    async fn new(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<State> {
         let window = WindowBuilder::new()
             .with_inner_size(LogicalSize::new(1280, 720))
             .build(event_loop)
@@ -347,7 +421,8 @@ impl State {
             &Self::surface_configuration(surface_format, window.inner_size()),
         );
 
-        let render_pipeline = RenderPipeline::new(&gpu.device, surface_format);
+        let render_pipeline = RenderPipeline::new(&gpu.device, surface_format)
+            .context("could not create render pipeline")?;
 
         Ok(State {
             instance,
@@ -360,6 +435,13 @@ impl State {
             time: Duration::from_secs(0),
             camera: Default::default(),
         })
+    }
+
+    pub fn reload(&mut self) -> anyhow::Result<()> {
+        eprintln!("reloading...");
+        self.render_pipeline = RenderPipeline::new(&self.gpu.device, self.surface_format)?;
+        eprintln!("reloading done");
+        Ok(())
     }
 
     fn surface_configuration(
@@ -377,7 +459,7 @@ impl State {
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        dbg!(new_size);
+        info!(?new_size, "resizing");
         if new_size.width * new_size.height == 0 {
             return;
         }
@@ -477,15 +559,18 @@ impl State {
     }
 
     fn update_buffers(&mut self) {
+        let window_size = self.window.inner_size();
         self.gpu.queue.write_buffer(
             &self.render_pipeline.uniform_buffer,
             0,
             bytemuck::cast_slice(&[Uniforms {
-                camera: self.camera.transform(self.window.inner_size()).inverse(),
+                camera: self.camera.transform(window_size).inverse(),
                 near: self.camera.near,
                 far: self.camera.far,
                 time: self.time.as_secs_f32(),
-                ..bytemuck::Zeroable::zeroed()
+                width: window_size.width as f32,
+                height: window_size.height as f32,
+                _padding: Default::default(),
             }]),
         )
     }
